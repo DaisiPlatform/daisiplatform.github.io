@@ -7,11 +7,14 @@
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 24px; }
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    body { margin: 24px; }
     header { display:flex; gap:16px; flex-wrap:wrap; align-items:center; }
-    h1 { font-size:1.3rem; margin:0; }
+    h1 { font-size:1.25rem; margin:0; }
     .controls { display:flex; gap:12px; flex-wrap:wrap; }
-    select, input { padding:6px 10px; border-radius:8px; border:1px solid #ccc; }
+    select, input, button { padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#fff; }
+    button { cursor:pointer; }
+    #status { font-size:0.9rem; color:#555; margin-top:8px; }
     #chart { width:100%; height:70vh; margin-top:16px; }
     footer { margin-top: 8px; font-size: .85rem; color:#666; }
   </style>
@@ -26,55 +29,143 @@
       <button id="refresh">Update</button>
     </div>
   </header>
+  <div id="status">Loading RBNZ dataset…</div>
   <div id="chart"></div>
   <footer>
-    Source: Reserve Bank of New Zealand — B1 Exchange rates & TWI (daily).
+    Source: Reserve Bank of New Zealand — B1 Exchange rates &amp; TWI (daily).
   </footer>
 
 <script>
 (async function () {
-  const URL = "https://www.rbnz.govt.nz/-/media/project/sites/rbnz/files/statistics/series/b/b1/hb1-daily.xlsx";
-  const buf = await fetch(URL).then(r => r.arrayBuffer());
-  const wb = XLSX.read(buf, { type: "array" });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  let df = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
-  const headerIdx = df.findIndex(row => row.some(v => String(v).trim().toLowerCase() === "date"));
-  const headers = df[headerIdx].map(h => String(h||"").trim());
-  const dateColIdx = headers.findIndex(h => h.toLowerCase() === "date");
-  const rows = df.slice(headerIdx+1).filter(r => r.some(v => v!=null && v!==""));
-  const records = rows.map(r => {
-    const o={}; headers.forEach((h,i)=>o[h]=r[i]);
-    let d=o[headers[dateColIdx]];
-    if(typeof d==="number"){ d=new Date(Date.UTC(1899,11,30)+d*86400000);}
-    else{ d=new Date(d);}
-    o.Date=d; return o;
-  }).filter(r=>!isNaN(r.Date));
+  const PRIMARY_URL = "https://www.rbnz.govt.nz/-/media/project/sites/rbnz/files/statistics/series/b/b1/hb1-daily.xlsx";
+  // Fallback CORS proxy if needed (GitHub Pages sometimes needs this)
+  const CORS_PROXY = "https://cors.isomorphic-git.org/";
+  const STATUS = document.getElementById("status");
 
-  const allCols = headers.filter(h=>h && h.toLowerCase()!=="date");
-  const seriesSel=document.getElementById("series");
-  allCols.forEach(c=>{const o=document.createElement("option");o.value=c;o.textContent=c;seriesSel.appendChild(o)});
-  seriesSel.value=allCols.find(c=>c.toLowerCase().includes("united states"))||allCols[0];
+  try {
+    const buf = await fetchWithFallback(PRIMARY_URL);
+    const wb = XLSX.read(buf, { type: "array" });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    let arr = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
+    // Find header row containing "Date"
+    const headerIdx = arr.findIndex(row => Array.isArray(row) && row.some(v => String(v ?? "").trim().toLowerCase() === "date"));
+    if (headerIdx === -1) throw new Error("Could not find a 'Date' header in the sheet.");
+    const headers = arr[headerIdx].map(h => String(h ?? "").trim());
+    const dateColIdx = headers.findIndex(h => h.toLowerCase() === "date");
+    const rows = arr.slice(headerIdx + 1).filter(r => r && r.some(v => v != null && v !== ""));
 
-  const min=new Date(Math.min(...records.map(r=>r.Date)));
-  const max=new Date(Math.max(...records.map(r=>r.Date)));
-  const fmt=d=>d.toISOString().slice(0,10);
-  const startEl=document.getElementById("start"), endEl=document.getElementById("end");
-  startEl.value=fmt(new Date(max.getTime()-365*86400000)); startEl.min=fmt(min); startEl.max=fmt(max);
-  endEl.value=fmt(max); endEl.min=fmt(min); endEl.max=fmt(max);
-  document.getElementById("refresh").onclick=draw;
-  draw();
+    const records = rows.map(r => {
+      const o = {};
+      headers.forEach((h, i) => o[h || `col_${i}`] = r[i]);
+      // Normalize date (Excel serial or ISO)
+      let d = o[headers[dateColIdx]];
+      if (typeof d === "number") {
+        d = new Date(Date.UTC(1899, 11, 30) + d * 86400000);
+      } else {
+        d = new Date(d);
+      }
+      o.Date = d;
+      return o;
+    }).filter(r => !isNaN(r.Date));
 
-  function draw(){
-    const s=seriesSel.value;
-    const start=new Date(startEl.value), end=new Date(endEl.value);
-    const pts=records.filter(r=>r.Date>=start&&r.Date<=end)
-                     .map(r=>({x:r.Date,y:+r[s]}))
-                     .filter(p=>!isNaN(p.y));
-    Plotly.newPlot("chart",[{
-      x:pts.map(p=>p.x),y:pts.map(p=>p.y),
-      type:"scatter",mode:"lines",line:{width:2},
-      hovertemplate:"%{x|%Y-%m-%d}<br>"+s+": %{y:.4f}<extra></extra>"
-    }],{title:`${s} vs NZD (Daily)`,hovermode:"x unified"});
+    // Build list of numeric series (exclude 'Date' and empty headers)
+    const allCols = headers.filter(h => h && h.toLowerCase() !== "date");
+    // Heuristic: keep columns that have at least one numeric value
+    const numCols = allCols.filter(col => records.some(r => isFinite(safeNum(r[col]))));
+    if (numCols.length === 0) {
+      throw new Error("No numeric series found. The sheet layout may have changed.");
+    }
+
+    const seriesSel = document.getElementById("series");
+    numCols.forEach(c => {
+      const opt = document.createElement("option");
+      opt.value = c; opt.textContent = c;
+      seriesSel.appendChild(opt);
+    });
+
+    // Prefer USD if available
+    const usdName = numCols.find(c => c.toLowerCase().includes("united states")) || numCols[0];
+    seriesSel.value = usdName;
+
+    // Date pickers
+    const minDate = new Date(Math.min(...records.map(r => r.Date)));
+    const maxDate = new Date(Math.max(...records.map(r => r.Date)));
+    const toISO = d => new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0,10);
+    const startEl = document.getElementById("start");
+    const endEl = document.getElementById("end");
+    startEl.min = toISO(minDate); startEl.max = toISO(maxDate);
+    endEl.min = toISO(minDate);   endEl.max = toISO(maxDate);
+    const defStart = new Date(maxDate); defStart.setDate(defStart.getDate() - 365);
+    startEl.value = toISO(defStart < minDate ? minDate : defStart);
+    endEl.value = toISO(maxDate);
+
+    document.getElementById("refresh").addEventListener("click", draw);
+    window.addEventListener("resize", () => Plotly.Plots.resize(document.getElementById("chart")));
+    draw();
+
+    STATUS.textContent = "Loaded.";
+    function draw() {
+      const s = seriesSel.value;
+      const start = new Date(startEl.value);
+      const end = new Date(endEl.value);
+      if (!(start instanceof Date) || !(end instanceof Date) || isNaN(start) || isNaN(end) || start > end) {
+        STATUS.textContent = "Invalid date range.";
+        return;
+      }
+      const filtered = records
+        .filter(r => r.Date >= start && r.Date <= end)
+        .map(r => ({ x: r.Date, y: safeNum(r[s]) }))
+        .filter(p => isFinite(p.y))
+        .sort((a, b) => a.x - b.x);
+
+      if (filtered.length === 0) {
+        STATUS.textContent = "No data in selected range for this series.";
+      } else {
+        STATUS.textContent = "";
+      }
+
+      const trace = {
+        x: filtered.map(p => p.x),
+        y: filtered.map(p => p.y),
+        type: 'scatter',
+        mode: 'lines',
+        line: { width: 2 },
+        hovertemplate: '%{x|%Y-%m-%d}<br>' + s + ': %{y:.4f}<extra></extra>'
+      };
+      const layout = {
+        title: `${s} vs NZD (Daily)`,
+        margin: { l: 50, r: 20, t: 50, b: 40 },
+        xaxis: { title: 'Date' },
+        yaxis: { title: s, rangemode: 'normal' },
+        hovermode: 'x unified'
+      };
+      Plotly.newPlot('chart', [trace], layout, { responsive: true, displaylogo: false });
+    }
+
+  } catch (err) {
+    console.error(err);
+    STATUS.textContent = "Error: " + err.message + " (open DevTools console for details)";
+  }
+
+  async function fetchWithFallback(url) {
+    // Try direct fetch first
+    try {
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return await r.arrayBuffer();
+    } catch (e) {
+      console.warn("Direct fetch failed, retrying via CORS proxy:", e);
+      const proxied = CORS_PROXY + url;
+      const r2 = await fetch(proxied, { cache: "no-store" });
+      if (!r2.ok) throw new Error("Proxy HTTP " + r2.status);
+      return await r2.arrayBuffer();
+    }
+  }
+
+  function safeNum(v) {
+    if (v == null || v === "") return NaN;
+    const n = Number(String(v).replace(/[^0-9.\\-]/g, ""));
+    return isFinite(n) ? n : NaN;
   }
 })();
 </script>
